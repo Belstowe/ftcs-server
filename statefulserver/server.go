@@ -9,7 +9,9 @@ import (
 	"encoding/gob"
 	"encoding/pem"
 	"errors"
+	"log"
 	"math/big"
+	"time"
 
 	"github.com/Belstowe/ftcs-server/statefulserver/models"
 	"github.com/quic-go/quic-go"
@@ -46,12 +48,13 @@ func NewServer(addrs ...string) (_ *Server, err error) {
 		NextProtos:         []string{"quic-ftcs-server"},
 	}
 	for i := range addrs {
-		if conn, err := quic.DialAddr(addrs[i], tlsConf, nil); err == nil {
+		if conn, err := quic.DialAddr(addrs[i], tlsConf, &quic.Config{HandshakeIdleTimeout: time.Second, KeepAlivePeriod: time.Second}); err == nil {
 			srv.conn = append(srv.conn, conn)
 		}
 	}
-	srv.determineMaster()
-	return &srv, nil
+	err = srv.determineMaster()
+	go srv.ping()
+	return &srv, err
 }
 
 func (s *Server) determineMaster() (err error) {
@@ -98,6 +101,45 @@ func (s *Server) removeConnection(i int) error {
 	return nil
 }
 
+func (s *Server) ping() {
+	var err error
+	for range time.Tick(time.Second * 3) {
+		for i := range s.conn {
+			var stream quic.Stream
+			if stream, err = s.conn[i].AcceptStream(context.Background()); err != nil {
+				if err = s.removeConnection(i); err != nil {
+					log.Println(err)
+				}
+				continue
+			}
+			enc := gob.NewEncoder(stream)
+			dec := gob.NewDecoder(stream)
+			if err = enc.Encode(models.Ping{}); err != nil {
+				log.Println(err)
+				if err = s.removeConnection(i); err != nil {
+					log.Println(err)
+				}
+				continue
+			}
+			var res interface{}
+			if err = dec.Decode(&res); err != nil {
+				if err = s.removeConnection(i); err != nil {
+					log.Println(err)
+				}
+				continue
+			}
+			switch res.(type) {
+			case models.Pong:
+			default:
+				if err = s.removeConnection(i); err != nil {
+					log.Println(err)
+					continue
+				}
+			}
+		}
+	}
+}
+
 func (s *Server) PeerListen() (err error) {
 	var conn quic.Connection
 	if conn, err = s.peerListener.Accept(context.Background()); err != nil {
@@ -116,6 +158,10 @@ func (s *Server) PeerListen() (err error) {
 	switch res.(type) {
 	case models.AddMe:
 		s.conn = append(s.conn, conn)
+	case models.Ping:
+		if err = enc.Encode(models.Pong{}); err != nil {
+			return err
+		}
 	case models.IAmMaster:
 		switch s.masterIndex {
 		case -1:
