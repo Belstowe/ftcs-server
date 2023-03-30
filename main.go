@@ -7,7 +7,7 @@ import (
 )
 
 func main() {
-	srv := assert(statefulserver.NewServer())
+	srv := assert(statefulserver.NewServer("ftcs-server-1:5001", "ftcs-server-2:5001", "ftcs-server-3:5001"))
 	for {
 		if err := srv.PeerListen(); err != nil {
 			log.Println(err)

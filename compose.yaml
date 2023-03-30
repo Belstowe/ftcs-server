@@ -1,0 +1,41 @@
+version: '3.7'
+
+services:
+  ftcs-server-1:
+    build:
+      context: .
+    container_name: ftcs-server-1
+    hostname: ftcs-server-1
+    networks:
+      - server-side
+    # sysctls:
+    #  net.core.rmem_max: 2500000
+    ports:
+      - '15000:5000'
+
+  ftcs-server-2:
+    build:
+      context: .
+    container_name: ftcs-server-2
+    hostname: ftcs-server-2
+    networks:
+      - server-side
+    #sysctls:
+    #  net.core.rmem_max: 2500000
+    ports:
+      - '15001:5000'
+  
+  ftcs-server-3:
+    build:
+      context: .
+    container_name: ftcs-server-3
+    hostname: ftcs-server-3
+    networks:
+      - server-side
+    #sysctls:
+    #  net.core.rmem_max: 2500000
+    ports:
+      - '15002:5000'
+
+networks:
+  server-side:
