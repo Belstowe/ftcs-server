@@ -10,11 +10,15 @@ import (
 )
 
 func main() {
+	var server *statefulserver.Server
+	var err error
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339}).Level(zerolog.DebugLevel)
-	if _, err := statefulserver.NewServer("ftcs-server-1:5001", "ftcs-server-2:5001", "ftcs-server-3:5001"); err != nil {
+	if server, err = statefulserver.NewServer("ftcs-server-1:5001", "ftcs-server-2:5001", "ftcs-server-3:5001"); err != nil {
 		log.Fatal().Msg(err.Error())
 	}
-	// log.Info().Msg("listening on 0.0.0.0:5000...")
-	for range time.Tick(time.Minute) {
+	for {
+		if err = server.Listen(); err != nil {
+			log.Error().Msg(err.Error())
+		}
 	}
 }

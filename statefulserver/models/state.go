@@ -1,49 +1,30 @@
 package models
 
-import "encoding/gob"
+import (
+	"encoding/gob"
 
-type CellState byte
-
-const (
-	CellFree  CellState = iota
-	CellWhite CellState = iota
-	CellBlack CellState = iota
-)
-
-type MoveState byte
-
-const (
-	MoveWhite MoveState = iota
-	MoveBlack MoveState = iota
-	WinWhite  MoveState = iota
-	WinBlack  MoveState = iota
+	"github.com/Belstowe/ftcs-server/statefulserver/reversi"
 )
 
 type State struct {
 	GameStarted bool
-	Board       [8][8]CellState
-	Move        MoveState
+	Board       reversi.Board
+	Move        reversi.MoveState
 }
 
 func NewState() *State {
-	var cells [8][8]CellState
-	for cellRow := range cells {
-		for cellIndex := range cells[cellRow] {
-			cells[cellRow][cellIndex] = CellFree
-		}
-	}
-	cells[3][3] = CellWhite
-	cells[3][4] = CellBlack
-	cells[4][3] = CellBlack
-	cells[4][4] = CellWhite
 	return &State{
 		GameStarted: false,
-		Board:       cells,
-		Move:        MoveWhite,
+		Board:       *reversi.NewBoard(),
+		Move:        reversi.MoveWhite,
 	}
 }
 
 type RequestState struct{}
+
+type SendState struct {
+	State
+}
 
 type StateToMaster struct {
 	State

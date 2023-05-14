@@ -23,6 +23,7 @@ type Server struct {
 	peerHostname        map[uuid.UUID]string
 	isPeerConnInitiator map[uuid.UUID]bool
 	peerListener        quic.Listener
+	clientListener      quic.Listener
 	serverID            uuid.UUID
 	masterID            uuid.NullUUID
 	masterChannel       chan struct{}
@@ -60,7 +61,36 @@ func NewServer(addrs ...string) (srv *Server, err error) {
 		}
 	}
 	srv.determineMaster()
+	if srv.clientListener, err = quic.ListenAddr("0.0.0.0:5000", srv.tlsConfig, &quic.Config{HandshakeIdleTimeout: time.Second, KeepAlivePeriod: time.Second}); err != nil {
+		return nil, err
+	}
+	log.Info().Msg("listening for clients on 0.0.0.0:5000...")
 	return srv, nil
+}
+
+func (s *Server) Listen() (err error) {
+	var conn quic.Connection
+	if conn, err = s.clientListener.Accept(context.Background()); err != nil {
+		return err
+	}
+	log.Debug().Str("type", "client").Msgf("received connection from %v", conn.RemoteAddr())
+	go func(conn quic.Connection) {
+		var model interface{}
+		if model, err = s.recv(conn); err != nil {
+			log.Debug().
+				Str("type", "client").
+				Str("address", conn.LocalAddr().String()).
+				Msg(err.Error())
+			return
+		}
+		switch typedModel := model.(type) {
+		case models.RequestState:
+			s.send(conn, models.SendState{State: s.state})
+		default:
+			s.send(conn, models.ClientError{Message: fmt.Sprintf("unknown model %T, either random or not yet implemented", typedModel)})
+		}
+	}(conn)
+	return nil
 }
 
 func (s *Server) initPeerConnection(addr string) (err error) {
@@ -221,14 +251,15 @@ func (s Server) recv(conn quic.Connection) (model interface{}, err error) {
 
 func (s *Server) peerListen() {
 	var conn quic.Connection
-	var model interface{}
 	var err error
 	for {
 		if conn, err = s.peerListener.Accept(context.Background()); err != nil {
 			continue
 		}
 		log.Debug().Msgf("received connection from %s", conn.RemoteAddr())
-		go func() {
+		go func(conn quic.Connection) {
+			var model interface{}
+			var err error
 			if model, err = s.recv(conn); err != nil {
 				log.Debug().Msg(err.Error())
 				return
@@ -254,7 +285,7 @@ func (s *Server) peerListen() {
 				log.Debug().Msgf("invalid data received from peer %s: expected models.Pong, got %T", conn.RemoteAddr(), model)
 				return
 			}
-		}()
+		}(conn)
 	}
 }
 
