@@ -25,6 +25,8 @@ type Server struct {
 	peerListener        quic.Listener
 	serverID            uuid.UUID
 	masterID            uuid.NullUUID
+	masterChannel       chan struct{}
+	state               models.State
 	tlsConfig           *tls.Config
 }
 
@@ -35,6 +37,8 @@ func NewServer(addrs ...string) (srv *Server, err error) {
 		isPeerConnInitiator: make(map[uuid.UUID]bool),
 		serverID:            uuid.New(),
 		masterID:            uuid.NullUUID{},
+		masterChannel:       make(chan struct{}),
+		state:               *models.NewState(),
 	}
 	log.Debug().Msgf("generated id %s", srv.serverID)
 	if srv.tlsConfig, err = generateTLSConfig(); err != nil {
@@ -113,7 +117,7 @@ func (s *Server) listenOnPeer(id uuid.UUID) {
 			}
 			return
 		}
-		switch model.(type) {
+		switch typedModel := model.(type) {
 		case models.Ping:
 			s.send(s.peerConn[id], models.Pong{ID: s.serverID})
 		case models.Pong:
@@ -129,10 +133,25 @@ func (s *Server) listenOnPeer(id uuid.UUID) {
 				s.send(s.peerConn[id], models.MasterYes{})
 			}
 		case models.MasterNo:
-			break
+			s.masterChannel <- struct{}{}
 		case models.MasterYes:
 			s.masterID.UUID = id
 			s.masterID.Valid = true
+			s.masterChannel <- struct{}{}
+		case models.RequestState:
+			s.send(s.peerConn[id], models.StateFromMaster{State: s.state})
+		case models.StateFromMaster:
+			s.state = typedModel.State
+			s.masterID.UUID = id
+			s.masterID.Valid = true
+		case models.StateToMaster:
+			s.state = typedModel.State
+			for slaveId, conn := range s.peerConn {
+				if slaveId == id {
+					continue
+				}
+				s.send(conn, models.StateFromMaster{State: s.state})
+			}
 		default:
 			break
 		}
@@ -155,6 +174,7 @@ func (s *Server) fallbackOnPeer(id uuid.UUID) {
 func (s *Server) determineMaster() {
 	if s.masterID.Valid {
 		log.Debug().Msgf("master already found, it is %v", s.masterID.UUID)
+		s.send(s.peerConn[s.masterID.UUID], models.RequestState{})
 		return
 	}
 	log.Debug().Msg("starting master process")
@@ -162,6 +182,11 @@ func (s *Server) determineMaster() {
 	s.masterID.Valid = true
 	for _, conn := range s.peerConn {
 		s.send(conn, models.AreYouMaster{})
+		<-s.masterChannel
+	}
+	log.Debug().Msgf("final master is %v", s.masterID.UUID)
+	if s.masterID.UUID != s.serverID {
+		s.send(s.peerConn[s.masterID.UUID], models.RequestState{})
 	}
 }
 
