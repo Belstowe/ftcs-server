@@ -24,6 +24,7 @@ type Server struct {
 	isPeerConnInitiator map[uuid.UUID]bool
 	peerListener        quic.Listener
 	serverID            uuid.UUID
+	masterID            uuid.NullUUID
 	tlsConfig           *tls.Config
 }
 
@@ -33,6 +34,7 @@ func NewServer(addrs ...string) (srv *Server, err error) {
 		peerHostname:        make(map[uuid.UUID]string),
 		isPeerConnInitiator: make(map[uuid.UUID]bool),
 		serverID:            uuid.New(),
+		masterID:            uuid.NullUUID{},
 	}
 	log.Debug().Msgf("generated id %s", srv.serverID)
 	if srv.tlsConfig, err = generateTLSConfig(); err != nil {
@@ -43,13 +45,17 @@ func NewServer(addrs ...string) (srv *Server, err error) {
 		return nil, err
 	}
 	go srv.peerListen()
-	log.Info().Msg("listening on 0.0.0.0:5001...")
+	log.Info().Msg("listening for peers on 0.0.0.0:5001...")
 	for _, addr := range addrs {
 		log.Debug().Str("address", addr).Msgf("making contact")
 		if err = srv.initPeerConnection(addr); err != nil {
+			if err.Error() == "Application error 0x0 (remote)" {
+				continue
+			}
 			log.Error().Str("address", addr).Msg(err.Error())
 		}
 	}
+	srv.determineMaster()
 	return srv, nil
 }
 
@@ -71,6 +77,7 @@ func (s *Server) initPeerConnection(addr string) (err error) {
 	case models.Pong:
 		if typedModel.ID == s.serverID {
 			log.Debug().Msgf("ignored server %s as id %v was identical (=> it is probably my hostname)", addr, s.serverID)
+			conn.CloseWithError(quic.ApplicationErrorCode(0), "")
 			break
 		}
 		if _, ok := s.peerConn[typedModel.ID]; !ok {
@@ -97,6 +104,10 @@ func (s *Server) listenOnPeer(id uuid.UUID) {
 				Err(err).
 				Msg("one of servers died, waiting for it to recover...")
 			delete(s.peerConn, id)
+			if s.masterID.UUID == id {
+				s.masterID = uuid.NullUUID{}
+				s.determineMaster()
+			}
 			if s.isPeerConnInitiator[id] {
 				s.fallbackOnPeer(id)
 			}
@@ -107,6 +118,21 @@ func (s *Server) listenOnPeer(id uuid.UUID) {
 			s.send(s.peerConn[id], models.Pong{ID: s.serverID})
 		case models.Pong:
 			break
+		case models.AreYouMaster:
+			if !s.masterID.Valid || s.serverID == s.masterID.UUID {
+				s.send(s.peerConn[id], models.MasterNo{})
+				if !s.masterID.Valid {
+					s.masterID.Valid = true
+					s.masterID.UUID = id
+				}
+			} else {
+				s.send(s.peerConn[id], models.MasterYes{})
+			}
+		case models.MasterNo:
+			break
+		case models.MasterYes:
+			s.masterID.UUID = id
+			s.masterID.Valid = true
 		default:
 			break
 		}
@@ -115,12 +141,27 @@ func (s *Server) listenOnPeer(id uuid.UUID) {
 
 func (s *Server) fallbackOnPeer(id uuid.UUID) {
 	var err error
-	for range time.Tick(time.Second * 5) {
+	ticker := time.NewTicker(time.Second * 5)
+	defer ticker.Stop()
+	for range ticker.C {
 		if err = s.initPeerConnection(s.peerHostname[id]); err == nil {
 			log.Info().Str("id", id.String()).Str("address", s.peerHostname[id]).Msg("woke up!")
 			return
 		}
 		log.Info().Str("id", id.String()).Str("address", s.peerHostname[id]).Msg("still not alive")
+	}
+}
+
+func (s *Server) determineMaster() {
+	if s.masterID.Valid {
+		log.Debug().Msgf("master already found, it is %v", s.masterID.UUID)
+		return
+	}
+	log.Debug().Msg("starting master process")
+	s.masterID.UUID = s.serverID
+	s.masterID.Valid = true
+	for _, conn := range s.peerConn {
+		s.send(conn, models.AreYouMaster{})
 	}
 }
 
@@ -171,6 +212,7 @@ func (s *Server) peerListen() {
 			case models.Ping:
 				if typedModel.ID == s.serverID {
 					log.Debug().Msgf("ignored peer %s as id %v was identical (=> it is probably my hostname)", conn.RemoteAddr(), s.serverID)
+					conn.CloseWithError(quic.ApplicationErrorCode(0), "")
 					return
 				}
 				if err = s.send(conn, models.Pong{ID: s.serverID}); err != nil {
