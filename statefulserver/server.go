@@ -19,16 +19,20 @@ import (
 )
 
 type Server struct {
-	peerConn     map[uuid.UUID]quic.Connection
-	peerListener quic.Listener
-	serverID     uuid.UUID
-	tlsConfig    *tls.Config
+	peerConn            map[uuid.UUID]quic.Connection
+	peerHostname        map[uuid.UUID]string
+	isPeerConnInitiator map[uuid.UUID]bool
+	peerListener        quic.Listener
+	serverID            uuid.UUID
+	tlsConfig           *tls.Config
 }
 
 func NewServer(addrs ...string) (srv *Server, err error) {
 	srv = &Server{
-		peerConn: make(map[uuid.UUID]quic.Connection),
-		serverID: uuid.New(),
+		peerConn:            make(map[uuid.UUID]quic.Connection),
+		peerHostname:        make(map[uuid.UUID]string),
+		isPeerConnInitiator: make(map[uuid.UUID]bool),
+		serverID:            uuid.New(),
 	}
 	log.Debug().Msgf("generated id %s", srv.serverID)
 	if srv.tlsConfig, err = generateTLSConfig(); err != nil {
@@ -71,7 +75,10 @@ func (s *Server) initPeerConnection(addr string) (err error) {
 		}
 		if _, ok := s.peerConn[typedModel.ID]; !ok {
 			log.Info().Msgf("successfully written %s (id: %v) into cluster!", addr, typedModel.ID)
+			s.peerHostname[typedModel.ID] = addr
 			s.peerConn[typedModel.ID] = conn
+			s.isPeerConnInitiator[typedModel.ID] = true
+			go s.listenOnPeer(typedModel.ID)
 		}
 	default:
 		return fmt.Errorf("invalid data received from peer %s: expected models.Pong, got %T", addr, model)
@@ -79,12 +86,50 @@ func (s *Server) initPeerConnection(addr string) (err error) {
 	return nil
 }
 
+func (s *Server) listenOnPeer(id uuid.UUID) {
+	var model interface{}
+	var err error
+	for {
+		if model, err = s.recv(s.peerConn[id]); err != nil {
+			log.Warn().Str("id", id.String()).
+				Str("address", s.peerHostname[id]).
+				Str("peer-address", s.peerConn[id].RemoteAddr().String()).
+				Err(err).
+				Msg("one of servers died, waiting for it to recover...")
+			delete(s.peerConn, id)
+			if s.isPeerConnInitiator[id] {
+				s.fallbackOnPeer(id)
+			}
+			return
+		}
+		switch model.(type) {
+		case models.Ping:
+			s.send(s.peerConn[id], models.Pong{ID: s.serverID})
+		case models.Pong:
+			break
+		default:
+			break
+		}
+	}
+}
+
+func (s *Server) fallbackOnPeer(id uuid.UUID) {
+	var err error
+	for range time.Tick(time.Second * 5) {
+		if err = s.initPeerConnection(s.peerHostname[id]); err == nil {
+			log.Info().Str("id", id.String()).Str("address", s.peerHostname[id]).Msg("woke up!")
+			return
+		}
+		log.Info().Str("id", id.String()).Str("address", s.peerHostname[id]).Msg("still not alive")
+	}
+}
+
 func (s Server) send(conn quic.Connection, model interface{}) (err error) {
 	var stream quic.SendStream
 	if stream, err = conn.OpenUniStream(); err != nil {
 		return err
 	}
-	stream.SetWriteDeadline(time.Now().Add(time.Second))
+	// stream.SetWriteDeadline(time.Now().Add(time.Second))
 	defer stream.Close()
 	encoder := gob.NewEncoder(stream)
 	if err = encoder.Encode(&model); err != nil {
@@ -99,7 +144,7 @@ func (s Server) recv(conn quic.Connection) (model interface{}, err error) {
 	if stream, err = conn.AcceptUniStream(context.Background()); err != nil {
 		return nil, err
 	}
-	stream.SetReadDeadline(time.Now().Add(time.Second))
+	// stream.SetReadDeadline(time.Now().Add(time.Second))
 	decoder := gob.NewDecoder(stream)
 	if err = decoder.Decode(&model); err != nil {
 		return nil, err
@@ -134,6 +179,9 @@ func (s *Server) peerListen() {
 				if _, ok := s.peerConn[typedModel.ID]; !ok {
 					log.Info().Msgf("successfully written %s (id: %v) into cluster!", conn.RemoteAddr(), typedModel.ID)
 					s.peerConn[typedModel.ID] = conn
+					s.isPeerConnInitiator[typedModel.ID] = false
+					s.peerHostname[typedModel.ID] = conn.RemoteAddr().String()
+					go s.listenOnPeer(typedModel.ID)
 				}
 			default:
 				log.Debug().Msgf("invalid data received from peer %s: expected models.Pong, got %T", conn.RemoteAddr(), model)
