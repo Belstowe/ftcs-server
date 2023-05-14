@@ -1,10 +1,18 @@
 package models
 
-import "encoding/gob"
+import (
+	"encoding/gob"
 
-type Ping struct{}
+	"github.com/google/uuid"
+)
 
-type Pong struct{}
+type Ping struct {
+	ID uuid.UUID
+}
+
+type Pong struct {
+	ID uuid.UUID
+}
 
 func init() {
 	gob.Register(Ping{})

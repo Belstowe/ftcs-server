@@ -1,23 +1,18 @@
 package main
 
 import (
-	"log"
+	"os"
+	"time"
 
 	"github.com/Belstowe/ftcs-server/statefulserver"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
 func main() {
-	srv := assert(statefulserver.NewServer("ftcs-server-1:5001", "ftcs-server-2:5001", "ftcs-server-3:5001"))
-	for {
-		if err := srv.PeerListen(); err != nil {
-			log.Println(err)
-		}
+	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339})
+	if _, err := statefulserver.NewServer("ftcs-server-1:5001", "ftcs-server-2:5001", "ftcs-server-3:5001"); err != nil {
+		log.Fatal().Msg(err.Error())
 	}
-}
-
-func assert[T any](res T, err error) T {
-	if err != nil {
-		log.Fatalln(err)
-	}
-	return res
+	log.Info().Msg("listening on 0.0.0.0:5000...")
 }

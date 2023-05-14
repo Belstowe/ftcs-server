@@ -8,174 +8,123 @@ import (
 	"crypto/x509"
 	"encoding/gob"
 	"encoding/pem"
-	"errors"
-	"log"
+	"fmt"
 	"math/big"
 	"time"
 
 	"github.com/Belstowe/ftcs-server/statefulserver/models"
+	"github.com/google/uuid"
 	"github.com/quic-go/quic-go"
+	"github.com/rs/zerolog/log"
 )
 
 type Server struct {
-	conn           []quic.Connection
-	clientListener quic.Listener
-	peerListener   quic.Listener
-	masterIndex    int
-	sharedState    SharedState
+	peerConn     map[uuid.UUID]quic.Connection
+	peerListener quic.Listener
+	serverID     uuid.UUID
+	tlsConfig    *tls.Config
 }
 
-func NewServer(addrs ...string) (_ *Server, err error) {
-	var tlsConf *tls.Config
-	if tlsConf, err = generateTLSConfig(); err != nil {
+func NewServer(addrs ...string) (srv *Server, err error) {
+	if srv.tlsConfig, err = generateTLSConfig(); err != nil {
 		return nil, err
 	}
-
-	srv := Server{
-		conn:        make([]quic.Connection, 0, len(addrs)),
-		masterIndex: -1,
-		sharedState: NewSharedState(),
-	}
-	if srv.clientListener, err = quic.ListenAddr("0.0.0.0:5000", tlsConf, nil); err != nil {
+	if srv.peerListener, err = quic.ListenAddr("0.0.0.0:5001", srv.tlsConfig, &quic.Config{HandshakeIdleTimeout: time.Second, KeepAlivePeriod: time.Second}); err != nil {
 		return nil, err
 	}
-	if srv.peerListener, err = quic.ListenAddr("0.0.0.0:5001", tlsConf, nil); err != nil {
-		return nil, err
-	}
-
-	tlsConf = &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"quic-ftcs-server"},
-	}
-	for i := range addrs {
-		if conn, err := quic.DialAddr(addrs[i], tlsConf, &quic.Config{HandshakeIdleTimeout: time.Second, KeepAlivePeriod: time.Second}); err == nil {
-			srv.conn = append(srv.conn, conn)
+	srv.serverID = uuid.New()
+	go srv.peerListen()
+	for _, addr := range addrs {
+		if err = srv.initPeerConnection(addr); err != nil {
+			log.Error().Str("address", addr).Msg(err.Error())
 		}
 	}
-	err = srv.determineMaster()
-	go srv.ping()
-	return &srv, err
+	return srv, nil
 }
 
-func (s *Server) determineMaster() (err error) {
-connLoop:
-	for i := range s.conn {
-		if s.masterIndex != -1 {
-			return nil
-		}
-		var stream quic.Stream
-		if stream, err = s.conn[i].OpenStreamSync(context.Background()); err != nil {
-			return err
-		}
-		enc := gob.NewEncoder(stream)
-		if err = enc.Encode(models.IAmMaster{}); err != nil {
-			return err
-		}
-		dec := gob.NewDecoder(stream)
-		var res interface{}
-		if err = dec.Decode(&res); err != nil {
-			return err
-		}
-		switch res.(type) {
-		case models.IAmMaster:
-			s.masterIndex = i
-			break connLoop
-		case models.OK:
-			continue connLoop
-		default:
-			return errors.New("received invalid response from a server")
-		}
-	}
-	return nil
-}
-
-func (s *Server) removeConnection(i int) error {
-	if i >= len(s.conn) {
-		return errors.New("out of range")
-	}
-	s.conn[i] = s.conn[len(s.conn)-1]
-	s.conn = s.conn[:len(s.conn)-1]
-	if i == s.masterIndex {
-		return s.determineMaster()
-	}
-	return nil
-}
-
-func (s *Server) ping() {
-	var err error
-	for range time.Tick(time.Second * 3) {
-		for i := range s.conn {
-			var stream quic.Stream
-			if stream, err = s.conn[i].AcceptStream(context.Background()); err != nil {
-				if err = s.removeConnection(i); err != nil {
-					log.Println(err)
-				}
-				continue
-			}
-			enc := gob.NewEncoder(stream)
-			dec := gob.NewDecoder(stream)
-			if err = enc.Encode(models.Ping{}); err != nil {
-				log.Println(err)
-				if err = s.removeConnection(i); err != nil {
-					log.Println(err)
-				}
-				continue
-			}
-			var res interface{}
-			if err = dec.Decode(&res); err != nil {
-				if err = s.removeConnection(i); err != nil {
-					log.Println(err)
-				}
-				continue
-			}
-			switch res.(type) {
-			case models.Pong:
-			default:
-				if err = s.removeConnection(i); err != nil {
-					log.Println(err)
-					continue
-				}
-			}
-		}
-	}
-}
-
-func (s *Server) PeerListen() (err error) {
+func (s *Server) initPeerConnection(addr string) (err error) {
 	var conn quic.Connection
-	if conn, err = s.peerListener.Accept(context.Background()); err != nil {
+	if conn, err = quic.DialAddr(addr, s.tlsConfig, &quic.Config{HandshakeIdleTimeout: time.Second, KeepAlivePeriod: time.Second}); err != nil {
 		return err
 	}
-	var stream quic.Stream
-	if stream, err = conn.AcceptStream(context.Background()); err != nil {
+	if err = s.send(conn, models.Ping{ID: s.serverID}); err != nil {
 		return err
 	}
-	enc := gob.NewEncoder(stream)
-	dec := gob.NewDecoder(stream)
-	var res interface{}
-	if err = dec.Decode(&res); err != nil {
-		return nil
+	var model interface{}
+	if model, err = s.recv(conn); err != nil {
+		return err
 	}
-	switch res.(type) {
-	case models.AddMe:
-		s.conn = append(s.conn, conn)
-	case models.Ping:
-		if err = enc.Encode(models.Pong{}); err != nil {
-			return err
+	switch typedModel := model.(type) {
+	case models.Pong:
+		if typedModel.ID == s.serverID {
+			log.Debug().Msgf("ignored server %s as id %v was identical (=> it is probably my hostname)", addr, s.serverID)
+			break
 		}
-	case models.IAmMaster:
-		switch s.masterIndex {
-		case -1:
-			if err = enc.Encode(models.IAmMaster{}); err != nil {
-				return err
-			}
-		default:
-			if err = enc.Encode(models.OK{}); err != nil {
-				return err
-			}
+		if _, ok := s.peerConn[typedModel.ID]; !ok {
+			log.Info().Msgf("successfully written %s (id: %v) into cluster!", addr, typedModel.ID)
+			s.peerConn[typedModel.ID] = conn
 		}
 	default:
+		return fmt.Errorf("invalid data received from peer %s: expected models.Pong, got %T", addr, model)
 	}
 	return nil
+}
+
+func (s Server) send(conn quic.Connection, model interface{}) (err error) {
+	var stream quic.SendStream
+	if stream, err = conn.OpenUniStream(); err != nil {
+		return err
+	}
+	defer stream.Close()
+	encoder := gob.NewEncoder(stream)
+	if err = encoder.Encode(model); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s Server) recv(conn quic.Connection) (model interface{}, err error) {
+	var stream quic.ReceiveStream
+	if stream, err = conn.AcceptUniStream(context.Background()); err != nil {
+		return nil, err
+	}
+	decoder := gob.NewDecoder(stream)
+	if err = decoder.Decode(model); err != nil {
+		return nil, err
+	}
+	return model, nil
+}
+
+func (s *Server) peerListen() {
+	var conn quic.Connection
+	var model interface{}
+	var err error
+	for {
+		if conn, err = s.peerListener.Accept(context.Background()); err != nil {
+			continue
+		}
+		go func() {
+			if model, err = s.recv(conn); err != nil {
+				return
+			}
+			switch typedModel := model.(type) {
+			case models.Ping:
+				if typedModel.ID == s.serverID {
+					log.Debug().Msgf("ignored peer %s as id %v was identical (=> it is probably my hostname)", conn.RemoteAddr(), s.serverID)
+					return
+				}
+				if err = s.send(conn, models.Pong{ID: s.serverID}); err != nil {
+					return
+				}
+				if _, ok := s.peerConn[typedModel.ID]; !ok {
+					log.Info().Msgf("successfully written %s (id: %v) into cluster!", conn.RemoteAddr(), typedModel.ID)
+					s.peerConn[typedModel.ID] = conn
+				}
+			default:
+				return
+			}
+		}()
+	}
 }
 
 func generateTLSConfig() (_ *tls.Config, err error) {
