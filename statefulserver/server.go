@@ -26,15 +26,22 @@ type Server struct {
 }
 
 func NewServer(addrs ...string) (srv *Server, err error) {
+	srv = &Server{
+		peerConn: make(map[uuid.UUID]quic.Connection),
+		serverID: uuid.New(),
+	}
+	log.Debug().Msgf("generated id %s", srv.serverID)
 	if srv.tlsConfig, err = generateTLSConfig(); err != nil {
 		return nil, err
 	}
+	log.Trace().Msgf("generated tls config %+v", srv.tlsConfig)
 	if srv.peerListener, err = quic.ListenAddr("0.0.0.0:5001", srv.tlsConfig, &quic.Config{HandshakeIdleTimeout: time.Second, KeepAlivePeriod: time.Second}); err != nil {
 		return nil, err
 	}
-	srv.serverID = uuid.New()
 	go srv.peerListen()
+	log.Info().Msg("listening on 0.0.0.0:5001...")
 	for _, addr := range addrs {
+		log.Debug().Str("address", addr).Msgf("making contact")
 		if err = srv.initPeerConnection(addr); err != nil {
 			log.Error().Str("address", addr).Msg(err.Error())
 		}
@@ -47,9 +54,11 @@ func (s *Server) initPeerConnection(addr string) (err error) {
 	if conn, err = quic.DialAddr(addr, s.tlsConfig, &quic.Config{HandshakeIdleTimeout: time.Second, KeepAlivePeriod: time.Second}); err != nil {
 		return err
 	}
+	log.Debug().Str("address", addr).Msg("successfully dialed")
 	if err = s.send(conn, models.Ping{ID: s.serverID}); err != nil {
 		return err
 	}
+	log.Debug().Str("address", addr).Msg("sent ping")
 	var model interface{}
 	if model, err = s.recv(conn); err != nil {
 		return err
@@ -75,11 +84,13 @@ func (s Server) send(conn quic.Connection, model interface{}) (err error) {
 	if stream, err = conn.OpenUniStream(); err != nil {
 		return err
 	}
+	stream.SetWriteDeadline(time.Now().Add(time.Second))
 	defer stream.Close()
 	encoder := gob.NewEncoder(stream)
-	if err = encoder.Encode(model); err != nil {
+	if err = encoder.Encode(&model); err != nil {
 		return err
 	}
+	log.Debug().Str("peer-address", conn.RemoteAddr().String()).Msgf("sent packet %#v", model)
 	return nil
 }
 
@@ -88,10 +99,12 @@ func (s Server) recv(conn quic.Connection) (model interface{}, err error) {
 	if stream, err = conn.AcceptUniStream(context.Background()); err != nil {
 		return nil, err
 	}
+	stream.SetReadDeadline(time.Now().Add(time.Second))
 	decoder := gob.NewDecoder(stream)
-	if err = decoder.Decode(model); err != nil {
+	if err = decoder.Decode(&model); err != nil {
 		return nil, err
 	}
+	log.Debug().Str("peer-address", conn.RemoteAddr().String()).Msgf("received packet %#v", model)
 	return model, nil
 }
 
@@ -103,8 +116,10 @@ func (s *Server) peerListen() {
 		if conn, err = s.peerListener.Accept(context.Background()); err != nil {
 			continue
 		}
+		log.Debug().Msgf("received connection from %s", conn.RemoteAddr())
 		go func() {
 			if model, err = s.recv(conn); err != nil {
+				log.Debug().Msg(err.Error())
 				return
 			}
 			switch typedModel := model.(type) {
@@ -121,6 +136,7 @@ func (s *Server) peerListen() {
 					s.peerConn[typedModel.ID] = conn
 				}
 			default:
+				log.Debug().Msgf("invalid data received from peer %s: expected models.Pong, got %T", conn.RemoteAddr(), model)
 				return
 			}
 		}()
@@ -132,7 +148,7 @@ func generateTLSConfig() (_ *tls.Config, err error) {
 	if key, err = rsa.GenerateKey(rand.Reader, 1024); err != nil {
 		return nil, err
 	}
-	template := x509.Certificate{SerialNumber: big.NewInt(2)}
+	template := x509.Certificate{SerialNumber: big.NewInt(2), NotAfter: time.Now().Add(365 * 24 * time.Hour)}
 	var certDer []byte
 	if certDer, err = x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key); err != nil {
 		return nil, err
@@ -144,7 +160,8 @@ func generateTLSConfig() (_ *tls.Config, err error) {
 		return nil, err
 	}
 	return &tls.Config{
-		Certificates: []tls.Certificate{tlsCert},
-		NextProtos:   []string{"quic-ftcs-server"},
+		Certificates:       []tls.Certificate{tlsCert},
+		NextProtos:         []string{"quic-ftcs-server"},
+		InsecureSkipVerify: true,
 	}, nil
 }
